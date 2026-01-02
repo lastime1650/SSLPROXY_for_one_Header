@@ -175,6 +175,11 @@ sudo iptables -I OUTPUT -p udp --dport 443 -j DROP
 sudo ./sslproxy
 ```
 
+> [!WARNING]
+> 위 방식으로 쓰는건 의미가 없습니다.
+> 작성된 HPP 하나를 여러분의 프로젝트에 include 해서 사용하는 방식입니다.
+
+
 ### 실행 전 체크리스트
 1.  `config.proxySpecs`에 `"https 0.0.0.0 8443"` 등이 올바르게 설정되었는가?
 2.  `config.caKey`, `config.caCert`, `config.leafKey` 경로가 정확한가?
