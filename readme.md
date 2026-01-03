@@ -8,6 +8,13 @@ Use Examples:
 - 2. Use in class format
 - 3. DPI Deep Packet Inspection with Application Layer
 
+# Update list
+
+> # update
+> fork 방식을 std::thread 방식으로 전환.
+>
+
+
 # Explain
 
 `SSLPROXY` 코드를 빌드하고 실행하기 위해서는 **C++ 컴파일러**, **OpenSSL**, **Libevent**, **Libpcap**, **Libnet**, **SQLite3**, 그리고 **PcapPlusPlus** 라이브러리가 필요합니다.

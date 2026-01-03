@@ -11,6 +11,7 @@
 // ============================================================================
 // 1. System Includes (Common to all files)
 // ============================================================================
+#include <sys/un.h>
 #include <iostream>
 #include <vector>
 #include <memory>
@@ -51,21 +52,14 @@
 #include <event2/buffer.h>
 #include <event2/thread.h>
 #include <event2/dns.h>
+#include <thread>
 
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 
-#include <pcapplusplus/RawPacket.h>
-#include <pcapplusplus/Packet.h>
-#include <pcapplusplus/IPv4Layer.h>
-#include <pcapplusplus/TcpLayer.h>
-#include <pcapplusplus/PayloadLayer.h>
-#include <pcapplusplus/HttpLayer.h>
-
-
 // Optional Dependencies (Define macros if you don't have them)
 #ifndef WITHOUT_MIRROR
-#include <pcap.h>
+//#include <pcap.h>
 #include <libnet.h>
 #endif
 #ifndef WITHOUT_USERAUTH
@@ -164,7 +158,6 @@ struct log_content_ctx {
     struct log_content_mirror_ctx *mirror;
 #endif
 };
-
 
 
 /* 
@@ -4130,6 +4123,9 @@ struct global {
 	// @todo Use different openssl engines for each proxyspec, so move to opts?
 	char *openssl_engine;
 #endif /* !OPENSSL_NO_ENGINE */
+
+
+	int ipc_write_fd; // 부모에 입력할 파이프 파일 디스크립터
 };
 
 #ifndef WITHOUT_USERAUTH
@@ -6034,7 +6030,7 @@ const char *build_features = BUILD_FEATURES;
 #include <sys/uio.h>
 #include <sys/stat.h>
 #include <sys/file.h>
-#include <sys/un.h>
+
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -22191,162 +22187,45 @@ pxy_set_dstaddr(pxy_conn_ctx_t *ctx)
 int
 pxy_bev_readcb_preexec_logging_and_stats(struct bufferevent *bev, pxy_conn_ctx_t *ctx)
 {
-	if (bev == ctx->src.bev || bev == ctx->dst.bev) {
-		struct evbuffer *inbuf = bufferevent_get_input(bev);
-		size_t inbuf_size = evbuffer_get_length(inbuf);
-		if (bev == ctx->src.bev) {
-			ctx->thr->intif_in_bytes += inbuf_size;
-		} else {
-			ctx->thr->intif_out_bytes += inbuf_size;
-		}
+    if (bev == ctx->src.bev || bev == ctx->dst.bev) {
+        struct evbuffer *inbuf = bufferevent_get_input(bev);
+        size_t inbuf_size = evbuffer_get_length(inbuf);
+        
+        // 통계 업데이트
+        if (bev == ctx->src.bev) {
+            ctx->thr->intif_in_bytes += inbuf_size;
+        } else {
+            ctx->thr->intif_out_bytes += inbuf_size;
+        }
 
+        if (inbuf_size > 0) {
+            int is_request = (bev == ctx->src.bev); // true => client->server 요청
 
-		if (inbuf_size > 0) {
-			int is_request = (bev == ctx->src.bev); // true => client->server 요청
-
-			uint32_t current_seq, current_ack;
-			if (is_request) {
-                // Client가 보냄: Seq는 Client의 현재 Seq, Ack는 Server의 현재 Seq
+            uint32_t current_seq, current_ack;
+            if (is_request) {
+                // Client -> Server
                 current_seq = ctx->virtual_src_seq;
                 current_ack = ctx->virtual_dst_seq;
-                
-                // 상태 업데이트: Client Seq 증가
                 ctx->virtual_src_seq += inbuf_size;
             } else {
-                // Server가 보냄: Seq는 Server의 현재 Seq, Ack는 Client의 현재 Seq
+                // Server -> Client
                 current_seq = ctx->virtual_dst_seq;
                 current_ack = ctx->virtual_src_seq;
-
-                // 상태 업데이트: Server Seq 증가
                 ctx->virtual_dst_seq += inbuf_size;
             }
 
-			// IP 및 Port 정보 설정
-            struct sockaddr *s_addr, *d_addr;
-            if (is_request) {
-                s_addr = (struct sockaddr *)&ctx->srcaddr; 
-                d_addr = (struct sockaddr *)&ctx->dstaddr; 
-            } else {
-                s_addr = (struct sockaddr *)&ctx->dstaddr; 
-                d_addr = (struct sockaddr *)&ctx->srcaddr; 
-            }
-			if (s_addr->sa_family == AF_INET && d_addr->sa_family == AF_INET) {
-				struct sockaddr_in *src_in = (struct sockaddr_in *)s_addr;
-                struct sockaddr_in *dst_in = (struct sockaddr_in *)d_addr;
 
-                size_t header_size = sizeof(struct ip) + sizeof(struct tcphdr);
-                size_t total_size = header_size + inbuf_size;
-                
-                unsigned char *packet_buffer = (unsigned char *)malloc(total_size);
-                if (packet_buffer) {
-                    struct ip *iph = (struct ip *)packet_buffer;
-                    struct tcphdr *tcph = (struct tcphdr *)(packet_buffer + sizeof(struct ip));
-                    unsigned char *payload_ptr = packet_buffer + header_size;
+			/*
+				Hook 여기 ! 
+			*/
 
-                    // IP Header
-                    memset(iph, 0, sizeof(struct ip));
-                    iph->ip_hl = 5;
-                    iph->ip_v = 4;
-                    iph->ip_len = htons(total_size);
-                    iph->ip_id = htons(sys_rand16());
-                    iph->ip_ttl = 64;
-                    iph->ip_p = IPPROTO_TCP;
-                    iph->ip_src = src_in->sin_addr;
-                    iph->ip_dst = dst_in->sin_addr;
+        }
 
-                    // TCP Header
-                    memset(tcph, 0, sizeof(struct tcphdr));
-                    tcph->th_sport = src_in->sin_port;
-                    tcph->th_dport = dst_in->sin_port;
-                    
-                    // [중요] 계산된 가상 Seq/Ack 주입
-                    tcph->th_seq = htonl(current_seq);
-                    tcph->th_ack = htonl(current_ack);
-                    
-                    tcph->th_off = 5; 
-                    tcph->th_flags = TH_PUSH | TH_ACK; // PSH+ACK
-                    tcph->th_win = htons(65535);
-
-                    // Payload 복사
-                    evbuffer_copyout(inbuf, payload_ptr, inbuf_size);
-
-                    // -------------------------------------------------------------
-                    // [USER CALLBACK] PcapPlusPlus 등으로 전달
-                    // packet_buffer, total_size를 넘김
-                    // -------------------------------------------------------------
-                    // OnHookPacket(packet_buffer, total_size);
-
-					try {
-                        struct timeval ts;
-                        gettimeofday(&ts, NULL);
-
-                        // LINKTYPE_IPV4 (101) 또는 LINKTYPE_RAW (12) 사용
-                        // Ethernet 헤더가 없으므로 이를 명시해야 함
-                        pcpp::RawPacket rawPacket(packet_buffer, (int)total_size, ts, false, pcpp::LINKTYPE_IPV4);
-                        
-                        // 파싱
-                        pcpp::Packet parsedPacket(&rawPacket);
-
-                        if (parsedPacket.isPacketOfType(pcpp::IPv4) && parsedPacket.isPacketOfType(pcpp::TCP)) {
-                            pcpp::IPv4Layer* ipLayer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
-                            pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
-                            
-                            std::cout << "================ [PCPP HOOK TEST] ================" << std::endl;
-                            std::cout << "Direction: " << (is_request ? "Request (Cli->Srv)" : "Response (Srv->Cli)") << std::endl;
-                            std::cout << "Flow: " << ipLayer->getSrcIPAddress() << ":" << tcpLayer->getSrcPort() 
-                                      << " -> " << ipLayer->getDstIPAddress() << ":" << tcpLayer->getDstPort() << std::endl;
-                            
-                            // TCP 헤더 정보 확인 (Host Order 변환은 pcpp가 처리하거나 ntohl 필요)
-                            // pcpp의 getSequenceNumber() 등은 호스트 바이트 오더로 반환함
-                            std::cout << "Seq: " << tcpLayer->getTcpHeader()->sequenceNumber 
-                                      << " (Raw: " << ntohl(tcpLayer->getTcpHeader()->sequenceNumber) << ")" << std::endl;
-                            std::cout << "Ack: " << tcpLayer->getTcpHeader()->ackNumber << std::endl;
-                            
-                            // Payload 확인
-                            std::cout << "Payload Size: " << tcpLayer->getLayerPayloadSize() << " bytes" << std::endl;
-                            
-                            // 텍스트 데이터면 일부 출력
-                            if (tcpLayer->getLayerPayloadSize() > 0) {
-                                std::string payloadStr((char*)tcpLayer->getLayerPayload(), 
-                                                       std::min<size_t>(tcpLayer->getLayerPayloadSize(), 50));
-                                // 줄바꿈 제거 등 후처리 후 출력
-                                std::cout << "Data Peek: " << payloadStr.substr(0, payloadStr.find_first_of("\r\n")) << "..." << std::endl;
-                            }
-                            std::cout << "==================================================" << std::endl;
-
-							auto* HTTPLayer = parsedPacket.getLayerOfType<pcpp::HttpRequestLayer>();
-							if( HTTPLayer )
-							{
-								
-								std::cout << "URL:: " << HTTPLayer->getUrl() << std::endl;
-							}
-                        }
-
-						
-
-                    } catch (const std::exception& e) {
-                        std::cerr << "[PCPP ERROR] " << e.what() << std::endl;
-                    }
-
-                    free(packet_buffer);
-                }
-			}
-
-		}
-
-
-
-
-
-
-
-
-		if (WANT_CONTENT_LOG(ctx->conn)) {
-			// HTTP content logging at this point may record certain header lines twice, if we have not seen all headers yet
-			return pxy_log_content_inbuf(ctx, inbuf, (bev == ctx->src.bev));
-		}
-	}
-	return 0;
+        if (WANT_CONTENT_LOG(ctx->conn)) {
+            return pxy_log_content_inbuf(ctx, inbuf, (bev == ctx->src.bev));
+        }
+    }
+    return 0;
 }
 
 /*
@@ -24163,7 +24042,7 @@ proxy_conn_ctx_new(evutil_socket_t fd,
 		return NULL;
 	}
 
-	ctx->global = global;
+	ctx->global = global; ////////////////////////////////////////////////////////////////
 #ifndef WITHOUT_USERAUTH
 	ctx->clisock = clisock;
 #endif /* !WITHOUT_USERAUTH */
@@ -25224,6 +25103,7 @@ privsep_server(global_t *global, int sigpipe, int srvsock[], size_t nsrvsock,
 	return 0;
 }
 
+/*
 int
 privsep_client_openfile(int clisock, const char *fn, int mkpath)
 {
@@ -25272,8 +25152,26 @@ privsep_client_openfile(int clisock, const char *fn, int mkpath)
 	}
 
 	return fd;
+}*/
+static int privsep_client_openfile(int /*sock_ignored*/, const char *fn, int mkpath) {
+    if (mkpath) {
+        // dirname은 문자열을 수정할 수 있으므로 복사본 사용
+        char *fn_copy = strdup(fn);
+        if (!fn_copy) return -1;
+        
+        char *dname = dirname(fn_copy);
+        // sys_mkpath는 기존 sys.c에 정의된 함수 사용
+        if (sys_mkpath(dname, DFLT_DIRMODE) == -1) {
+            free(fn_copy);
+            return -1;
+        }
+        free(fn_copy);
+    }
+    // O_NOFOLLOW 등으로 보안을 강화할 수 있으나, 기존 호환성을 위해 유지
+    return open(fn, O_RDWR | O_CREAT | O_APPEND, DFLT_FILEMODE);
 }
 
+/*
 int
 privsep_client_opensock(int clisock, const proxyspec_t *spec)
 {
@@ -25322,8 +25220,54 @@ privsep_client_opensock(int clisock, const proxyspec_t *spec)
 	}
 
 	return fd;
+}*/
+
+static int privsep_client_opensock(int /*sock_ignored*/, const proxyspec_t *spec) {
+    evutil_socket_t fd;
+    int on = 1;
+
+    // 1. 소켓 생성
+    fd = socket(spec->listen_addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == -1) {
+        log_err_printf("Error creating socket: %s\n", strerror(errno));
+        return -1;
+    }
+
+    // 2. Non-blocking 설정
+    if (evutil_make_socket_nonblocking(fd) == -1) {
+        log_err_printf("Error setting non-blocking: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+
+    // 3. Keep-Alive 설정
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (void*)&on, sizeof(on)) == -1) {
+        log_err_printf("Error setting keep-alive: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+
+    // 4. Reuse Address 설정
+    if (evutil_make_listen_socket_reuseable(fd) == -1) {
+        log_err_printf("Error setting reuse-addr: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+
+    // 5. NAT 소켓 옵션 적용 (투명 프록시 등)
+    if (spec->natsocket && (spec->natsocket(fd) == -1)) {
+        log_err_printf("Error setting NAT options\n");
+        close(fd); return -1;
+    }
+
+    // 6. Bind
+    if (bind(fd, (struct sockaddr *)&spec->listen_addr, spec->listen_addrlen) == -1) {
+        log_err_printf("Error binding socket: %s\n", strerror(errno));
+        close(fd); return -1;
+    }
+
+    return fd;
 }
 
+
+/*
 int
 privsep_client_certfile(int clisock, const char *fn)
 {
@@ -25372,8 +25316,12 @@ privsep_client_certfile(int clisock, const char *fn)
 	}
 
 	return fd;
+}*/
+static int privsep_client_certfile(int /*sock_ignored*/, const char *fn) {
+    return open(fn, O_WRONLY | O_CREAT | O_EXCL, DFLT_FILEMODE);
 }
 
+/*
 int
 privsep_client_close(int clisock)
 {
@@ -25388,8 +25336,13 @@ privsep_client_close(int clisock)
 
 	close(clisock);
 	return 0;
+}*/
+static int privsep_client_close(int fd) {
+    if (fd >= 0) return close(fd);
+    return 0;
 }
 
+/*
 #ifndef WITHOUT_USERAUTH
 int
 privsep_client_update_atime(int clisock, const userdbkeys_t *keys)
@@ -25439,7 +25392,15 @@ privsep_client_update_atime(int clisock, const userdbkeys_t *keys)
 	// Does not return an fd
 	return 0;
 }
-#endif /* !WITHOUT_USERAUTH */
+#endif !WITHOUT_USERAUTH */
+
+#ifndef WITHOUT_USERAUTH
+static int privsep_client_update_atime(int /*sock_ignored*/, const userdbkeys_t *keys) {
+    // 멀티스레드 환경에서 SQLite 동시 접근 처리가 필요하므로, 
+    // 단순 변환 버전에서는 기능을 비활성화하거나 Mutex가 보장된 함수를 호출해야 함.
+    return 0; 
+}
+#endif
 
 /*
  * Fork and set up privilege separated monitor process.
@@ -25448,11 +25409,16 @@ privsep_client_update_atime(int clisock, const userdbkeys_t *keys)
  * sockets only for the child; on error and in the parent process it
  * will not be touched.
  */
+
+static int privsep_fork(global_t *, int [], size_t, int *) {
+    return -1; // 호출되면 안 됨
+}
+ /*
 int
 privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 {
-	int selfpipev[2]; /* self-pipe trick: signal handler -> select */
-	int chldpipev[2]; /* el cheapo interprocess sync early after fork */
+	int selfpipev[2];  self-pipe trick: signal handler -> select 
+	int chldpipev[2];  el cheapo interprocess sync early after fork 
 	int sockcliv[nclisock][2];
 	pid_t pid;
 
@@ -25511,13 +25477,13 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 		}
 		return -1;
 	} else if (pid == 0) {
-		/* child */
+		 child 
 		close(selfpipev[0]);
 		close(selfpipev[1]);
 		for (size_t i = 0; i < nclisock; i++)
 			close(sockcliv[i][0]);
-		/* wait until parent has installed signal handlers,
-		 * intentionally ignoring errors */
+		 wait until parent has installed signal handlers,
+		 * intentionally ignoring errors 
 		char buf[1];
 		ssize_t n;
 		close(chldpipev[1]);
@@ -25526,25 +25492,25 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 		} while (n == -1 && errno == EINTR);
 		close(chldpipev[0]);
 		log_dbg_printf("Privsep child pid %i\n", getpid());
-		/* return the privsep client sockets */
+		 return the privsep client sockets 
 		for (size_t i = 0; i < nclisock; i++)
 			clisock[i] = sockcliv[i][1];
 		return 0;
 	}
-	/* parent */
+	 parent 
 	for (size_t i = 0; i < nclisock; i++)
 		close(sockcliv[i][1]);
 	selfpipe_wrfd = selfpipev[1];
 
-	/* close file descriptors opened by preinit's only needed in client;
+	 close file descriptors opened by preinit's only needed in client;
 	 * we still call the preinit's before forking in order to provide
-	 * better user feedback and less privsep complexity */
+	 * better user feedback and less privsep complexity 
 	nat_preinit_undo();
 	log_preinit_undo();
 
-	/* If the child exits before the parent installs the signal handler
+	 If the child exits before the parent installs the signal handler
 	 * here, we have a race condition; this is solved by the client
-	 * blocking on the reading end of a pipe (chldpipev[0]). */
+	 * blocking on the reading end of a pipe (chldpipev[0]). 
 	if (signal(SIGHUP, privsep_server_signal_handler) == SIG_ERR) {
 		log_err_level_printf(LOG_CRIT, "Failed to install SIGHUP handler: %s (%i)\n",
 		               strerror(errno), errno);
@@ -25576,7 +25542,7 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 		return -1;
 	}
 
-	/* unblock the child */
+	 unblock the child 
 	close(chldpipev[0]);
 	close(chldpipev[1]);
 
@@ -25586,15 +25552,15 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 	if (privsep_server(global, selfpipev[0], socksrv, nclisock, pid) == -1) {
 		log_err_level_printf(LOG_CRIT, "Privsep server failed: %s (%i)\n",
 		               strerror(errno), errno);
-		/* fall through */
+		 fall through 
 	}
 #ifdef DEBUG_PRIVSEP_SERVER
 	log_dbg_printf("privsep_server exited\n");
-#endif /* DEBUG_PRIVSEP_SERVER */
+#endif  DEBUG_PRIVSEP_SERVER 
 
 	for (size_t i = 0; i < nclisock; i++)
 		close(sockcliv[i][0]);
-	selfpipe_wrfd = -1; /* tell signal handler not to write anymore */
+	selfpipe_wrfd = -1; tell signal handler not to write anymore 
 	close(selfpipev[0]);
 	close(selfpipev[1]);
 
@@ -25602,7 +25568,7 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 	pid_t wpid;
 	wpid = wait(&status);
 	if (wpid != pid) {
-		/* should never happen, warn if it does anyway */
+		 should never happen, warn if it does anyway 
 		log_err_printf("Child pid %lld != expected %lld from wait(2)\n",
 		               (long long)wpid, (long long)pid);
 	}
@@ -25620,13 +25586,13 @@ privsep_fork(global_t *global, int clisock[], size_t nclisock, int *parent_rv)
 		               (long long)wpid, WTERMSIG(status));
 		*parent_rv = 128 + WTERMSIG(status);
 	} else {
-		/* can only happen with WUNTRACED option or active tracing */
+		 can only happen with WUNTRACED option or active tracing 
 		log_err_level_printf(LOG_CRIT, "Child pid %lld neither exited nor killed\n",
 		               (long long)wpid);
 	}
 
 	return 1;
-}
+}*/
 
 /* vim: set noet ft=c: */
 
@@ -33610,6 +33576,7 @@ log_reopen(void)
 
 class SSLPROXY {
 public:
+    // 설정 구조체
     struct Config {
         std::string confFile;
         std::string caCert;
@@ -33652,29 +33619,35 @@ public:
     };
 
 private:
-    // Global lock to enforce singleton pattern due to underlying C global state
+    // 싱글톤 강제를 위한 락 (C 라이브러리의 전역 변수 충돌 방지)
     static std::atomic_flag _instance_lock;
 
     sslproxy_core::global_t* global = nullptr;
     sslproxy_core::proxy_ctx_t* proxy = nullptr;
     
-    // Internal state management
-    int clisock[6];
+    // 내부 상태 관리
+    int internal_pipe_fds[2] = { -1, -1 }; // [0]: Read(Thread), [1]: Write(C-Logic)
+    // privsep 로직을 제거했으므로 더미 소켓 배열을 전달
+    int dummy_clisocks[6] = { -1, -1, -1, -1, -1, -1 };
+    
     int pidfd = -1;
     char* nat_engine_str = nullptr;
     bool initialized = false;
 
+    // 스레드 관리
+    std::atomic<bool> is_running{ false };
+    std::shared_ptr<std::thread> proxy_thread;
+    std::shared_ptr<std::thread> packet_consumer_thread;
+
 public:
-    // Constructor: Prepares configuration and allocates memory.
-    // DOES NOT FORK or START THREADS here to ensure safety.
     SSLPROXY(const Config& config) {
         if (_instance_lock.test_and_set(std::memory_order_acquire)) {
-            throw std::runtime_error("SSLPROXY instance already exists! Only one instance allowed per process.");
+            throw std::runtime_error("SSLPROXY instance already exists! Only one instance allowed.");
         }
 
         using namespace sslproxy_core;
 
-        // 1. Increase File Descriptor Limits
+        // 1. FD 제한 증가
         struct rlimit rl;
         if (getrlimit(RLIMIT_NOFILE, &rl) != -1) {
             rl.rlim_cur = rl.rlim_max;
@@ -33683,7 +33656,7 @@ public:
             sslproxy_core::descriptor_table_size = rl.rlim_cur;
         }
 
-        // 2. Initialize Global Config Structure
+        // 2. Global 구조체 할당
         global = global_new();
         if (!global) {
             _instance_lock.clear(std::memory_order_release);
@@ -33697,7 +33670,7 @@ public:
             throw std::runtime_error("Out of memory");
         }
 
-        // 3. Apply Configuration
+        // 3. 설정 적용
         try {
             apply_config(config, tmp_opts);
         } catch (...) {
@@ -33706,14 +33679,13 @@ public:
             throw;
         }
 
-        // 4. [CRITICAL FIX] Link NAT Engine Callbacks
-        // This must be done after config parsing but before preinit
+        // 4. NAT 엔진 콜백 연결
         {
-            sslproxy_core::proxyspec_t *p = global->spec;
+            proxyspec_t *p = global->spec;
             while (p) {
                 if (p->natengine) {
-                    p->natlookup = sslproxy_core::nat_getlookupcb(p->natengine);
-                    p->natsocket = sslproxy_core::nat_getsocketcb(p->natengine);
+                    p->natlookup = nat_getlookupcb(p->natengine);
+                    p->natsocket = nat_getsocketcb(p->natengine);
                 }
                 p = p->next;
             }
@@ -33721,8 +33693,7 @@ public:
 
         tmp_opts_free(tmp_opts);
 
-        // 5. Pre-fork Initialization
-        // These setup log files and caches that need to exist before privsep
+        // 5. 사전 초기화 (Pre-fork Init -> Just Init)
         if (cachemgr_preinit() == -1) { cleanup(); throw std::runtime_error("Failed to preinit cachemgr"); }
         if (log_preinit(global) == -1) { cleanup(); throw std::runtime_error("Failed to preinit logging"); }
         if (nat_preinit() == -1) { cleanup(); throw std::runtime_error("Failed to preinit NAT"); }
@@ -33736,95 +33707,99 @@ public:
     }
 
     ~SSLPROXY() {
+        stop();
         cleanup();
     }
 
-    // Delete copy/move to prevent double-free or state corruption
+    // 복사/이동 금지
     SSLPROXY(const SSLPROXY&) = delete;
     SSLPROXY& operator=(const SSLPROXY&) = delete;
 
-    // The Main Loop
-    // This function performs the fork.
-    // Parent process blocks here until child exits.
-    // Child process runs the proxy loop here.
+    /**
+     * @brief 프록시 서버 실행 (비동기)
+     * @param PacketDataQueue 패킷 데이터를 받을 큐 (옵션)
+     * @return 0 성공, -1 실패
+     */
     int run() {
-        if (!initialized) return -1;
-        
+        if (!initialized || is_running) return -1;
+        is_running = true;
+
         using namespace sslproxy_core;
-        int rv = 0;
-        int parent_ret = 0;
 
-        // 1. Fork for Privilege Separation
-        // privsep_fork returns:
-        //  1: Parent (Monitor) - It blocks inside waiting for child signals. Returns exit code when child dies.
-        //  0: Child (Proxy) - Continues execution.
-        // -1: Error
-        int fork_ret = privsep_fork(global, clisock, 6, &parent_ret);
+        // -------------------------------------------------------
+        // [Thread 2] Proxy Worker (Libevent Loop)
+        // -------------------------------------------------------
+        proxy_thread = std::make_shared<std::thread>([this]() {
+            using namespace sslproxy_core;
 
-        if (fork_ret == -1) {
-            // Fork Error
-            if (global->pidfile) sys_pidf_close(pidfd, global->pidfile);
-            return -1;
+            // OpenSSL 초기화
+            if (ssl_init() == -1) {
+                std::cerr << "SSL Init Failed" << std::endl;
+                return;
+            }
+
+            // 프록시 컨텍스트 생성 (dummy_clisocks 전달 - 직접 호출로 바뀌었으므로 무시됨)
+            // proxy_new 내부에서 pxy_thrmgr_new() -> 워커 스레드 생성
+            proxy = proxy_new(global, -1);
+            if (!proxy) {
+                std::cerr << "Proxy Creation Failed" << std::endl;
+                return;
+            }
+
+            // 권한 하향 (주의: 프로세스 전체 권한 변경됨)
+            if (global->dropuser && sys_privdrop(global->dropuser, global->dropgroup, global->jaildir) == -1) {
+                std::cerr << "Privilege Drop Failed. Aborting." << std::endl;
+                return;
+            }
+
+            // 사후 초기화 (Post-fork Init -> Just Post Init)
+            if (log_init(global, proxy, dummy_clisocks) == -1) { std::cerr << "Log Post-Init Failed\n"; return; }
+            if (cachemgr_init() == -1) { std::cerr << "CacheMgr Post-Init Failed\n"; return; }
+            if (nat_init() == -1) { std::cerr << "NAT Post-Init Failed\n"; return; }
+
+            // 이벤트 루프 실행 (블로킹)
+            // proxy_run 내부에서 event_base_dispatch 호출
+            int rv = proxy_run(proxy);
+            
+            if (rv == -1) {
+                std::cerr << "Proxy Run Failed" << std::endl;
+            }
+        });
+
+        return 0; 
+    }
+
+    /**
+     * @brief 프록시 중지 및 리소스 정리
+     */
+    void stop() {
+        if (!is_running) return;
+        is_running = false;
+
+        using namespace sslproxy_core;
+
+        // 1. 이벤트 루프 중단
+        if (proxy) proxy_loopbreak(proxy, 0);
+
+        // 2. 프록시 스레드 종료 대기
+        if (proxy_thread && proxy_thread->joinable()) {
+            proxy_thread->join();
         }
-        else if (fork_ret == 1) {
-            // Parent Process (Monitor) has finished waiting
-            if (global->pidfile) sys_pidf_close(pidfd, global->pidfile);
-            return parent_ret; // Return child's exit code
+
+        // 3. 파이프 정리 및 패킷 스레드 종료
+        if (internal_pipe_fds[1] != -1) {
+            close(internal_pipe_fds[1]); // Write FD 닫음 -> Read FD에서 EOF 발생
+            internal_pipe_fds[1] = -1;
         }
-
-        // --- Child Process (Proxy) Starts Here ---
-
-        if (global->pidfile) close(pidfd); // Child closes PID file fd
-
-        // 2. Initialize Proxy Context
-        proxy = proxy_new(global, clisock[0]);
-        if (!proxy) {
-            // Cannot throw exception across process boundary cleanly, just exit
-            std::cerr << "Failed to initialize proxy in child" << std::endl;
-            exit(1);
-        }
-
-        // 3. Drop Privileges
-        if (sys_privdrop(global->dropuser, global->dropgroup, global->jaildir) == -1) {
-            std::cerr << "Failed to drop privileges" << std::endl;
-            exit(1);
-        }
-
-        // 4. Post-fork Initialization
-        if (ssl_reinit() == -1) {
-            std::cerr << "Failed to reinit SSL" << std::endl;
-            exit(1);
-        }
-
-        if (log_init(global, proxy, &clisock[1]) == -1) {
-            std::cerr << "Failed to init logging" << std::endl;
-            exit(1);
-        }
-        if (cachemgr_init() == -1) {
-            std::cerr << "Failed to init cachemgr" << std::endl;
-            exit(1);
-        }
-        if (nat_init() == -1) {
-            std::cerr << "Failed to init NAT" << std::endl;
-            exit(1);
-        }
-
-        // 5. Run Event Loop
-        // This blocks until the proxy is stopped
-        rv = proxy_run(proxy);
-
-        // 6. Cleanup in Child
-        privsep_client_close(clisock[0]);
         
-        // Ensure proper cleanup calls before exit
-        proxy_free(proxy);
-        proxy = nullptr;
+        if (packet_consumer_thread && packet_consumer_thread->joinable()) {
+            packet_consumer_thread->join();
+        }
         
-        // We do not call full cleanup() here because destructor will run on exit
-        // But we must release global singleton lock if we want to be clean
-        _instance_lock.clear(std::memory_order_release);
-        
-        return rv;
+        if (internal_pipe_fds[0] != -1) {
+            close(internal_pipe_fds[0]);
+            internal_pipe_fds[0] = -1;
+        }
     }
 
 private:
@@ -33833,7 +33808,6 @@ private:
         
         if (proxy) { proxy_free(proxy); proxy = nullptr; }
         
-        // Clean up static/global states in C code
         nat_fini();
         cachemgr_fini();
         log_fini();
@@ -33844,7 +33818,6 @@ private:
 
         if (pidfd != -1) { close(pidfd); pidfd = -1; }
 
-        // Release singleton lock
         _instance_lock.clear(std::memory_order_release);
         initialized = false;
     }
@@ -33852,21 +33825,17 @@ private:
     void apply_config(const Config& config, sslproxy_core::tmp_opts_t* tmp_opts) {
         using namespace sslproxy_core;
 
-        // NAT Engine String Setup
         if (!config.natEngine.empty()) nat_engine_str = strdup(config.natEngine.c_str());
         else if (nat_getdefaultname()) nat_engine_str = strdup(nat_getdefaultname());
 
-        // Load Config File first
         if (!config.confFile.empty()) {
             if (global_load_conffile(global, "sslproxy", config.confFile.c_str(), &nat_engine_str, tmp_opts) == -1)
                 throw std::runtime_error("Failed to load config file: " + config.confFile);
         }
 
-        // Helper Macros
         #define SET_OPT(func, field) if (!config.field.empty()) func(global->conn_opts, "sslproxy", config.field.c_str(), tmp_opts)
         #define SET_GLOB(func, field) if (!config.field.empty()) func(global, "sslproxy", config.field.c_str())
 
-        // Apply SSL Options
         SET_OPT(opts_set_cacrt, caCert);
         SET_OPT(opts_set_cakey, caKey);
         SET_OPT(opts_set_chain, caChain);
@@ -33883,7 +33852,6 @@ private:
         if (config.passthrough) opts_set_passthrough(global->conn_opts);
         if (config.disableSslComp) opts_unset_sslcomp(global->conn_opts);
 
-        // Apply Global Options
         SET_GLOB(global_set_leafkey, leafKey);
         SET_GLOB(global_set_leafcertdir, leafCertDir);
         SET_GLOB(global_set_defaultleafcert, defaultLeafCert);
@@ -33917,7 +33885,6 @@ private:
         if (!config.opensslEngine.empty()) global_set_openssl_engine(global, "sslproxy", config.opensslEngine.c_str());
         #endif
 
-        // Apply Proxy Specs
         for (const auto& specStr : config.proxySpecs) {
             char* line = strdup(specStr.c_str());
             if (load_proxyspec_line(global, "sslproxy", line, &nat_engine_str, 0, tmp_opts) == -1) {
@@ -33932,7 +33899,7 @@ private:
     }
 };
 
-// Define static member
+// Static Member Init
 std::atomic_flag SSLPROXY::_instance_lock = ATOMIC_FLAG_INIT;
 
 #endif // SSLPROXY_HPP
